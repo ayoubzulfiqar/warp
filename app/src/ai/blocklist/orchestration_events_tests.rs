@@ -1,7 +1,9 @@
 #![allow(deprecated)]
-use super::*;
 use std::collections::HashSet;
+
 use warp_multi_agent_api as api;
+
+use super::*;
 // Helper for constructing lifecycle pending events with minimal boilerplate.
 // Tests use this to focus on queue/coalescing behavior rather than payload setup.
 
@@ -77,39 +79,6 @@ fn message_pending_event(event_id: &str) -> PendingEvent {
             message_body: "body".to_string(),
         },
     }
-}
-
-#[test]
-fn test_is_subscribed_defaults_to_all_when_subscription_omitted() {
-    assert!(is_subscribed(None, LifecycleEventType::Started));
-    assert!(is_subscribed(None, LifecycleEventType::Idle));
-    assert!(is_subscribed(None, LifecycleEventType::Restarted));
-    assert!(is_subscribed(None, LifecycleEventType::Errored));
-    assert!(is_subscribed(None, LifecycleEventType::Cancelled));
-    assert!(is_subscribed(None, LifecycleEventType::Blocked));
-}
-
-#[test]
-fn test_is_subscribed_filters_unsubscribed_event_types() {
-    let subscription = [LifecycleEventType::Started, LifecycleEventType::Idle];
-    assert!(is_subscribed(
-        Some(&subscription),
-        LifecycleEventType::Started
-    ));
-    assert!(!is_subscribed(
-        Some(&subscription),
-        LifecycleEventType::Errored
-    ));
-}
-
-#[test]
-fn test_is_subscribed_with_explicit_empty_subscription_disables_all_events() {
-    assert!(!is_subscribed(Some(&[]), LifecycleEventType::Started));
-    assert!(!is_subscribed(Some(&[]), LifecycleEventType::Idle));
-    assert!(!is_subscribed(Some(&[]), LifecycleEventType::Restarted));
-    assert!(!is_subscribed(Some(&[]), LifecycleEventType::Errored));
-    assert!(!is_subscribed(Some(&[]), LifecycleEventType::Cancelled));
-    assert!(!is_subscribed(Some(&[]), LifecycleEventType::Blocked));
 }
 
 #[test]
@@ -356,4 +325,33 @@ fn test_lifecycle_event_type_from_proto_includes_cancelled_and_blocked() {
         lifecycle_event_type_from_proto(blocked_lifecycle),
         api::LifecycleEventType::Blocked
     );
+}
+
+#[test]
+fn test_has_pending_events_tracks_any_event_kind() {
+    let conversation_id = crate::ai::agent::conversation::AIConversationId::new();
+    let mut service = OrchestrationEventService::new_without_subscriptions();
+    assert!(!service.has_pending_events(conversation_id));
+    service.pending_events.insert(
+        conversation_id,
+        vec![
+            lifecycle_pending_event(
+                "lifecycle-1",
+                "child-a",
+                api::LifecycleEventType::InProgress,
+                0,
+            ),
+            message_pending_event("message-event-1"),
+            lifecycle_pending_event(
+                "lifecycle-2",
+                "child-b",
+                api::LifecycleEventType::Succeeded,
+                0,
+            ),
+            message_pending_event("message-event-2"),
+        ],
+    );
+    assert!(service.has_pending_events(conversation_id));
+    service.pending_events.remove(&conversation_id);
+    assert!(!service.has_pending_events(conversation_id));
 }

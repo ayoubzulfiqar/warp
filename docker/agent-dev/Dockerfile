@@ -1,4 +1,4 @@
-FROM ubuntu:latest
+FROM ubuntu:24.04
 
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
@@ -12,7 +12,7 @@ ENV PATH=/usr/local/cargo/bin:/usr/local/go/bin:$PATH
 RUN set -eux; \
   apt-get update; \
   apt-get install -y --no-install-recommends \
-    pkg-config git build-essential curl zsh fish vim locales sudo gnupg2 \
+    pkg-config git build-essential libclang-dev curl unzip zsh fish vim locales sudo gnupg2 \
     protobuf-compiler libprotobuf-dev \
     fontconfig zlib1g libasound2-dev \
     libx11-6 libxcb1 libxi6 libxcursor1 libxkbcommon-x11-0 \
@@ -22,7 +22,7 @@ RUN set -eux; \
     ca-certificates \
     xvfb
 
-# Install rustup. It will download the pinned version in our rust-toolchain.toml as needed.
+# Install rustup. The pinned Rust toolchain is installed below from rust-toolchain.toml.
 RUN set -eux; \
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal; \
   chmod -R a+w $RUSTUP_HOME $CARGO_HOME; \
@@ -70,7 +70,10 @@ RUN set -eux; \
 
 # Ensure the correct Rust toolchain is installed
 COPY ./rust-toolchain.toml ./setup/rust-toolchain.toml
-RUN cd ./setup && rustup toolchain install
+RUN set -eux; \
+  cd ./setup; \
+  rustup toolchain install; \
+  rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
 
 # Install all dependencies needed to build, run, and test Warp
 COPY ./script ./setup/script

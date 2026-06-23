@@ -1,5 +1,5 @@
 ---
-name: add-mcp-server
+name: agent-add-mcp
 description: Use this skill when helping users add MCP servers to their Warp configuration.
 ---
 
@@ -56,6 +56,24 @@ Check whether the target config file exists.
       "env": {
         "API_KEY": "${API_KEY}"
       }
+    }
+  }
+}
+```
+
+By default, Warp spawns stdio servers from the directory the config was discovered in:
+- Project-scoped configs (`{repo_root}/.warp/.mcp.json`) run from the repo root.
+- Global configs (`~/.warp/.mcp.json`, `~/.claude.json`, etc.) run from the home directory.
+
+If the server's `command` or `args` are relative paths (e.g. `./tooling/mcp/server.js`) or the server expects a specific cwd, set `working_directory` to override the default:
+
+```json
+{
+  "mcpServers": {
+    "server-name": {
+      "command": "node",
+      "args": ["./tooling/mcp/server.js"],
+      "working_directory": "/absolute/path/to/repo"
     }
   }
 }

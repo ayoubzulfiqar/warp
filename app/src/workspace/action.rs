@@ -17,15 +17,17 @@ use super::tab_settings::{
     VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
 use super::view::{OnboardingTutorial, WorkspaceBanner};
-use crate::ai::agent::api::ServerConversationToken;
-use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::AIAgentExchangeId;
+use crate::ai::agent::api::ServerConversationToken;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::agent::conversation::AIAgentHarness;
+use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::PendingAttachment;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
 use crate::auth::auth_manager::LoginGatedFeature;
-use crate::drive::items::WarpDriveItemId;
 use crate::drive::CloudObjectTypeAndId;
+use crate::drive::items::WarpDriveItemId;
 use crate::palette::PaletteMode;
 use crate::pane_group::PaneGroup;
 use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
@@ -42,8 +44,8 @@ use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::themes::theme_chooser::ThemeChooserMode;
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
-use crate::workspace::tab_group::TabGroupId;
 use crate::workspace::PaneViewLocator;
+use crate::workspace::tab_group::TabGroupId;
 
 /// This enum determines how the search query is initialized when opening command search.
 #[derive(Clone, Default, Debug)]
@@ -184,6 +186,10 @@ pub enum WorkspaceAction {
     ToggleTabGroupCollapsed(TabGroupId),
     /// Opens an inline editor over the given group's header for renaming.
     RenameTabGroup(TabGroupId),
+    /// Cancels any active rename (tab, pane, or group) without committing the
+    /// new name. Dispatched when clicking on the vtab panel background while a
+    /// rename editor is open.
+    CancelActiveRename,
     /// Creates a new tab group containing the tab at the given index.
     NewTabGroupFromTab(usize),
     /// Moves the tab at `tab_index` into `group_id`, appending it to the
@@ -208,12 +214,20 @@ pub enum WorkspaceAction {
     ClearTabMultiSelection,
     /// Creates a new tab group from the current tab multi-selection.
     NewTabGroupFromSelectedTabs,
+    /// Context-aware "create group" entry point for the keybinding: groups
+    /// the multi-selection when 2+ tabs are selected, otherwise groups the
+    /// active tab.
+    NewTabGroupFromActiveOrSelectedTabs,
     /// Moves every selected tab into `group_id`.
     MoveSelectedTabsToGroup {
         group_id: TabGroupId,
     },
     /// Removes every selected tab from its group (requires a single shared group).
     RemoveSelectedTabsFromGroup,
+    /// Context-aware "remove from group" entry point for the keybinding:
+    /// removes the multi-selection from its shared group when 2+ tabs are
+    /// selected, otherwise removes the active tab.
+    RemoveActiveOrSelectedTabsFromGroup,
     ToggleTabGroupRightClickMenu {
         group_id: TabGroupId,
         anchor: TabContextMenuAnchor,
@@ -230,12 +244,20 @@ pub enum WorkspaceAction {
     PinTab(usize),
     /// Unpins the tab at the given index.
     UnpinTab(usize),
+    /// Pins the active tab.
+    PinActiveTab,
+    /// Unpins the active tab.
+    UnpinActiveTab,
     /// Pins the entire tab group: sets the group as pinned
     /// and moves the group block to the end of the pinned region.
     PinTabGroup(TabGroupId),
     /// Unpins the entire tab group: clears the pinned flag on the group
     /// and moves the group block to the start of the unpinned region.
     UnpinTabGroup(TabGroupId),
+    /// Pins the active tab's group.
+    PinActiveTabGroup,
+    /// Unpins the active tab's group.
+    UnpinActiveTabGroup,
     AddDefaultTab,
     AddTerminalTab {
         hide_homepage: bool,
@@ -312,6 +334,12 @@ pub enum WorkspaceAction {
         color: AnsiColorIdentifier,
         tab_index: usize,
     },
+    /// Toggles the color for a tab group. Clears the color if it was already
+    /// set to `color`; otherwise applies `color` as the uniform group color.
+    ToggleTabGroupColor {
+        color: AnsiColorIdentifier,
+        group_id: TabGroupId,
+    },
     OpenLaunchConfigSaveModal,
     SelectTabConfig(TabConfig),
     DispatchToSettingsTab(SettingsTabAction),
@@ -345,7 +373,10 @@ pub enum WorkspaceAction {
     StartGroupDrag(TabGroupId),
     DragGroup {
         group_id: TabGroupId,
+        /// The dragged group's painted rect.
         position: RectF,
+        /// The position of the cursor while dragging a group.
+        cursor_position: Vector2F,
     },
     DropGroup,
     /// Toggles the left panel. In Code Mode V1 this toggles Warp Drive.
@@ -377,6 +408,10 @@ pub enum WorkspaceAction {
     /// Closes the focused panel. This happens as an explicit action from the user.
     ClosePanel,
     CopyTextToClipboard(String),
+    /// Copies a path to the clipboard based on the focused pane: the open file's display path
+    /// if the focused pane is the rendered file viewer (`FilePane`), otherwise the focused
+    /// terminal session's working directory. No-op if neither yields a path.
+    CopyCurrentPath,
     /// An action only registered in dev and local builds, which writes the user's current access
     /// token to the system clipboard to aid debugging and development.
     CopyAccessTokenToClipboard,
@@ -387,8 +422,7 @@ pub enum WorkspaceAction {
     /// An action only registered in dev and local builds, which triggers a
     /// panic immediately when called.
     Panic,
-    /// Stops the heap profiler (if one is running) and writes the profiling
-    /// data to disk.
+    /// Writes a heap profile to disk.
     DumpHeapProfile,
     ShowAIAssistantWarmWelcome,
     ClickedAIAssistantWarmWelcome,
@@ -585,6 +619,12 @@ pub enum WorkspaceAction {
     ContinueConversationLocally {
         conversation_id: AIConversationId,
     },
+    /// Continue a completed third-party cloud harness run in a local split pane.
+    #[cfg(not(target_family = "wasm"))]
+    ContinueThirdPartyConversationLocally {
+        task_id: AmbientAgentTaskId,
+        harness: AIAgentHarness,
+    },
     /// Insert the /fork slash command into the active terminal's input.
     InsertForkSlashCommand,
     /// Open a local-to-cloud handoff pane next to the active conversation
@@ -704,6 +744,12 @@ pub enum WorkspaceAction {
     /// Reset the orchestration launch modal dismissed state (for debugging)
     #[cfg(debug_assertions)]
     ResetOrchestrationLaunchModalState,
+    /// Open the Feature Intro Modal (for debugging)
+    #[cfg(debug_assertions)]
+    OpenFeatureIntroModal,
+    /// Reset the feature intro seen state (for debugging)
+    #[cfg(debug_assertions)]
+    ResetFeatureIntroModalState,
     /// Open the auto-handoff sleep modal (for debugging)
     #[cfg(debug_assertions)]
     OpenAutoHandoffSleepModal,
@@ -781,6 +827,8 @@ pub enum WorkspaceAction {
     StartAgentOnboardingTutorial(OnboardingTutorial),
     ShowSessionConfigModal,
     DismissSessionConfigTabConfigChip,
+    /// Dismiss the non-blocking feature-intro popover without requiring it to hold focus.
+    DismissFeatureIntroModal,
     /// Start the HOA onboarding flow (for debugging)
     #[cfg(debug_assertions)]
     ShowHoaOnboardingFlow,
@@ -868,6 +916,8 @@ impl WorkspaceAction {
         match self {
             #[cfg(not(target_family = "wasm"))]
             ContinueConversationLocally { .. } => true,
+            #[cfg(not(target_family = "wasm"))]
+            ContinueThirdPartyConversationLocally { .. } => true,
             ActivateTab(_)
             | ActivateTabByNumber(_)
             | ActivatePrevTab
@@ -902,8 +952,10 @@ impl WorkspaceAction {
             | MoveTabToGroup { .. }
             | RemoveTabFromGroup(_)
             | NewTabGroupFromSelectedTabs
+            | NewTabGroupFromActiveOrSelectedTabs
             | MoveSelectedTabsToGroup { .. }
             | RemoveSelectedTabsFromGroup
+            | RemoveActiveOrSelectedTabsFromGroup
             | UngroupTabs(_)
             | NewTabInGroup(_)
             | MoveTabGroupUp(_)
@@ -913,9 +965,14 @@ impl WorkspaceAction {
             | CloseTabsBelowGroup(_)
             | PinTab(_)
             | UnpinTab(_)
+            | PinActiveTab
+            | UnpinActiveTab
             | PinTabGroup(_)
             | UnpinTabGroup(_)
+            | PinActiveTabGroup
+            | UnpinActiveTabGroup
             | ToggleTabColor { .. }
+            | ToggleTabGroupColor { .. }
             | AddDefaultTab
             | AddTerminalTab { .. }
             | AddTabWithShell { .. }
@@ -1032,6 +1089,7 @@ impl WorkspaceAction {
             | ToggleVerticalTabsShowDetailsOnHover
             | ToggleWelcomeTips
             | CopyTextToClipboard(_)
+            | CopyCurrentPath
             | CopyAccessTokenToClipboard
             | OpenTabConfigRepoPicker { .. }
             | OpenNewWorktreeModal
@@ -1094,6 +1152,7 @@ impl WorkspaceAction {
             | ShiftSelectTabRange { .. }
             | ToggleTabMultiSelection { .. }
             | ClearTabMultiSelection
+            | CancelActiveRename
             | StartNewConversation { .. }
             | UndoRevertInCodeReviewPane { .. }
             | JumpToLatestToast
@@ -1123,6 +1182,7 @@ impl WorkspaceAction {
             | StartAgentOnboardingTutorial(_)
             | ShowSessionConfigModal
             | DismissSessionConfigTabConfigChip
+            | DismissFeatureIntroModal
             | SaveCurrentTabAsNewConfig(_)
             | SyncTrafficLights
             | OpenTabConfigErrorFile { .. }
@@ -1151,6 +1211,8 @@ impl WorkspaceAction {
             | ResetOpenWarpLaunchModalState
             | OpenOrchestrationLaunchModal
             | ResetOrchestrationLaunchModalState
+            | OpenFeatureIntroModal
+            | ResetFeatureIntroModalState
             | OpenAutoHandoffSleepModal
             | ResetAutoHandoffSleepModalState
             | TriggerAutoHandoffToCloud

@@ -1,300 +1,151 @@
-//! The in-memory cell grid that elements paint into and the renderer flushes to
-//! the terminal.
+//! The styled cell grid the element tree paints into.
 //!
-//! [`TuiBuffer`] is the headless assertion surface for the whole TUI backend:
-//! every element/presenter test paints into a buffer and compares
-//! [`to_lines`](TuiBuffer::to_lines) (and, where style matters, individual
-//! [`get`](TuiBuffer::get) cells) against expected values. All writes are
-//! clipped to the buffer bounds and are wide- and combining-grapheme aware, so
-//! callers never have to bounds-check or measure text themselves.
+//! This is ratatui's `Buffer` (re-exported as [`TuiBuffer`]) with `Style`
+//! re-exported as [`TuiStyle`] and `Cell` re-exported for convenience. Elements
+//! paint with the buffer's own grapheme-aware writers (`set_string`,
+//! `cell_mut`, `set_style`); the diff/flush to the terminal is the ratatui
+//! `Terminal`'s job, wired up by the runtime.
+//!
+//! [`TuiBufferExt::to_lines`] is the headless assertion hook used throughout the
+//! element tests: it renders each row to a `String`, skipping the trailing
+//! columns of wide graphemes so every glyph appears exactly once (mirroring how
+//! ratatui's own `Buffer` debug output collapses multi-width cells).
 
-use crossterm::style::Color;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use ratatui::buffer::CellWidth;
+pub use ratatui::buffer::{Buffer as TuiBuffer, Cell};
+pub use ratatui::style::{Color, Modifier, Style as TuiStyle};
+use ratatui::widgets::Widget;
 
-use super::{TuiRect, TuiSize};
+use super::geometry::{TuiPoint, TuiRect, TuiSize};
+use super::scene::TuiScreenPosition;
 
-/// The visual styling applied to a [`Cell`]. Cheap to copy; equality is exact,
-/// which is what makes style-sensitive buffer assertions possible.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TuiStyle {
-    pub foreground: Option<Color>,
-    pub background: Option<Color>,
-    pub bold: bool,
-    pub dim: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub reversed: bool,
+/// Absolute-coordinate paint access to one ratatui buffer.
+pub struct TuiPaintSurface<'a> {
+    buffer: &'a mut TuiBuffer,
+    screen_origin: TuiScreenPosition,
+    buffer_origin: TuiPoint,
 }
 
-impl TuiStyle {
-    pub fn with_foreground(mut self, color: Color) -> Self {
-        self.foreground = Some(color);
-        self
-    }
-
-    pub fn with_background(mut self, color: Color) -> Self {
-        self.background = Some(color);
-        self
-    }
-
-    pub fn with_bold(mut self, bold: bool) -> Self {
-        self.bold = bold;
-        self
-    }
-
-    pub fn with_dim(mut self, dim: bool) -> Self {
-        self.dim = dim;
-        self
-    }
-
-    pub fn with_italic(mut self, italic: bool) -> Self {
-        self.italic = italic;
-        self
-    }
-
-    pub fn with_underline(mut self, underline: bool) -> Self {
-        self.underline = underline;
-        self
-    }
-
-    pub fn with_reversed(mut self, reversed: bool) -> Self {
-        self.reversed = reversed;
-        self
-    }
-}
-
-/// A single terminal cell: one grapheme cluster plus its style.
-///
-/// A grapheme that occupies more than one column (e.g. a CJK character) is
-/// stored as a leading cell holding the symbol followed by one or more
-/// *continuation* cells; the renderer skips continuation cells so the wide
-/// glyph is emitted exactly once. Construct printable cells with [`Cell::new`];
-/// continuation cells are produced internally by the buffer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Cell {
-    symbol: String,
-    continuation: bool,
-    style: TuiStyle,
-}
-
-impl Cell {
-    /// A printable cell holding `symbol` (a single grapheme cluster) styled
-    /// with `style`.
-    pub fn new(symbol: impl Into<String>, style: TuiStyle) -> Self {
+impl<'a> TuiPaintSurface<'a> {
+    /// Creates an identity-mapped surface over `buffer`.
+    pub fn new(buffer: &'a mut TuiBuffer) -> Self {
+        let buffer_origin = TuiPoint::new(buffer.area.x, buffer.area.y);
         Self {
-            symbol: symbol.into(),
-            continuation: false,
-            style,
+            buffer,
+            screen_origin: TuiScreenPosition::new(
+                i32::from(buffer_origin.x),
+                i32::from(buffer_origin.y),
+            ),
+            buffer_origin,
         }
     }
 
-    /// A blank (space) cell with default styling. This is the fill value of a
-    /// freshly constructed buffer.
-    pub fn blank() -> Self {
+    /// Maps `screen_origin` to the top-left cell of `buffer`.
+    pub fn mapped(buffer: &'a mut TuiBuffer, screen_origin: TuiScreenPosition) -> Self {
         Self {
-            symbol: " ".to_owned(),
-            continuation: false,
-            style: TuiStyle::default(),
+            buffer_origin: TuiPoint::new(buffer.area.x, buffer.area.y),
+            buffer,
+            screen_origin,
         }
     }
 
-    pub fn symbol(&self) -> &str {
-        &self.symbol
+    /// Renders a ratatui widget within absolute screen bounds.
+    pub fn render_widget(
+        &mut self,
+        widget: impl Widget,
+        origin: TuiScreenPosition,
+        size: TuiSize,
+    ) -> bool {
+        let Some(area) = self.contained_buffer_rect(origin, size) else {
+            return false;
+        };
+        widget.render(area, self.buffer);
+        true
     }
 
-    pub fn style(&self) -> TuiStyle {
-        self.style
-    }
-
-    /// Whether this cell is the trailing column of a preceding wide grapheme.
-    /// The renderer emits nothing for continuation cells.
-    pub fn is_continuation(&self) -> bool {
-        self.continuation
-    }
-
-    fn continuation(style: TuiStyle) -> Self {
-        Self {
-            symbol: String::new(),
-            continuation: true,
-            style,
-        }
-    }
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self::blank()
-    }
-}
-
-/// A fixed-size grid of [`Cell`]s addressed by `(x, y)` in column/row order.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiBuffer {
-    size: TuiSize,
-    cells: Vec<Cell>,
-}
-
-impl TuiBuffer {
-    /// A blank buffer of the given size.
-    pub fn new(size: TuiSize) -> Self {
-        Self {
-            size,
-            cells: vec![Cell::default(); size.area()],
-        }
-    }
-
-    pub fn size(&self) -> TuiSize {
-        self.size
-    }
-
-    /// The cell at `(x, y)`, or `None` if out of bounds.
-    pub fn get(&self, x: u16, y: u16) -> Option<&Cell> {
-        self.index(x, y).map(|index| &self.cells[index])
-    }
-
-    /// Writes a single printable cell at `(x, y)`. Out-of-bounds positions are
-    /// silently ignored. Continuation/empty cells are ignored, since the buffer
-    /// manages continuations itself; use [`set_str`](TuiBuffer::set_str) for
-    /// wide graphemes.
-    pub fn set_cell(&mut self, x: u16, y: u16, cell: Cell) {
-        if cell.continuation || cell.symbol.is_empty() {
+    /// Applies `style` to the visible part of the absolute screen bounds.
+    pub fn set_style(&mut self, origin: TuiScreenPosition, size: TuiSize, style: TuiStyle) {
+        let Some(area) = self.buffer_rect(origin, size) else {
             return;
-        }
-        self.write_grapheme(x, y, &cell.symbol, cell.style);
-    }
-
-    /// Writes `text` starting at `(x, y)`, clipped to the lesser of `max_width`
-    /// columns and the buffer's right edge. Grapheme clusters that would cross
-    /// the limit are dropped whole (a wide glyph is never split). Returns the
-    /// number of columns actually advanced.
-    pub fn set_str(&mut self, x: u16, y: u16, max_width: u16, text: &str, style: TuiStyle) -> u16 {
-        if y >= self.size.height || x >= self.size.width {
-            return 0;
-        }
-        let limit = x.saturating_add(max_width).min(self.size.width);
-        let mut column = x;
-        for grapheme in text.graphemes(true) {
-            let width = grapheme_width(grapheme);
-            if column.saturating_add(width) > limit {
-                break;
-            }
-            self.write_grapheme(column, y, grapheme, style);
-            column = column.saturating_add(width);
-        }
-        column - x
-    }
-
-    /// Fills every cell of `rect` (intersected with the buffer) with a clone of
-    /// `cell`. Typically used to paint a styled background.
-    pub fn fill(&mut self, rect: TuiRect, cell: Cell) {
-        for y in rect.y..rect.bottom().min(self.size.height) {
-            for x in rect.x..rect.right().min(self.size.width) {
-                self.set_cell(x, y, cell.clone());
-            }
+        };
+        let area = area.intersection(self.buffer.area);
+        if !area.is_empty() {
+            self.buffer.set_style(area, style);
         }
     }
 
-    /// Renders the buffer to one `String` per row, omitting continuation cells
-    /// so wide glyphs appear once. This is the primary headless assertion hook.
-    pub fn to_lines(&self) -> Vec<String> {
-        (0..self.size.height)
-            .map(|y| {
+    /// Returns the cell at an absolute screen position.
+    pub fn cell(&self, position: TuiScreenPosition) -> Option<&Cell> {
+        self.buffer_point(position)
+            .and_then(|position| self.buffer.cell(position))
+    }
+
+    /// Returns the mutable cell at an absolute screen position.
+    pub fn cell_mut(&mut self, position: TuiScreenPosition) -> Option<&mut Cell> {
+        self.buffer_point(position)
+            .and_then(|position| self.buffer.cell_mut(position))
+    }
+
+    /// Replaces the cell at an absolute screen position.
+    pub fn set_cell(&mut self, position: TuiScreenPosition, cell: Cell) -> bool {
+        let Some(destination) = self.cell_mut(position) else {
+            return false;
+        };
+        *destination = cell;
+        true
+    }
+
+    fn contained_buffer_rect(&self, origin: TuiScreenPosition, size: TuiSize) -> Option<TuiRect> {
+        let area = self.buffer_rect(origin, size)?;
+        (area.intersection(self.buffer.area) == area).then_some(area)
+    }
+
+    fn buffer_rect(&self, origin: TuiScreenPosition, size: TuiSize) -> Option<TuiRect> {
+        let origin = self.buffer_point(origin)?;
+        origin.x.checked_add(size.width)?;
+        origin.y.checked_add(size.height)?;
+        Some(TuiRect::new(origin.x, origin.y, size.width, size.height))
+    }
+
+    fn buffer_point(&self, position: TuiScreenPosition) -> Option<TuiPoint> {
+        let x = i64::from(self.buffer_origin.x)
+            .checked_add(i64::from(position.x).checked_sub(i64::from(self.screen_origin.x))?)?;
+        let y = i64::from(self.buffer_origin.y)
+            .checked_add(i64::from(position.y).checked_sub(i64::from(self.screen_origin.y))?)?;
+        Some(TuiPoint::new(
+            u16::try_from(x).ok()?,
+            u16::try_from(y).ok()?,
+        ))
+    }
+}
+
+/// Headless rendering of a [`TuiBuffer`] to one `String` per row.
+pub trait TuiBufferExt {
+    /// Renders the buffer to one `String` per row, emitting each grapheme once
+    /// by skipping the trailing columns a wide grapheme occupies.
+    fn to_lines(&self) -> Vec<String>;
+}
+
+impl TuiBufferExt for TuiBuffer {
+    fn to_lines(&self) -> Vec<String> {
+        let area = self.area;
+        (0..area.height)
+            .map(|row| {
                 let mut line = String::new();
-                for x in 0..self.size.width {
-                    if let Some(cell) = self.get(x, y) {
-                        if !cell.is_continuation() {
-                            line.push_str(cell.symbol());
-                        }
+                let mut skip = 0u16;
+                for column in 0..area.width {
+                    let cell = &self[(area.x + column, area.y + row)];
+                    if skip == 0 {
+                        line.push_str(cell.symbol());
+                        skip = cell.cell_width().max(1) - 1;
+                    } else {
+                        skip -= 1;
                     }
                 }
                 line
             })
             .collect()
     }
-
-    fn write_grapheme(&mut self, x: u16, y: u16, grapheme: &str, style: TuiStyle) {
-        let width = grapheme_width(grapheme);
-        if x >= self.size.width
-            || y >= self.size.height
-            || x.saturating_add(width) > self.size.width
-        {
-            return;
-        }
-
-        // Clear any wide grapheme we are about to partially overwrite, both at
-        // the head and across the columns the new grapheme will occupy.
-        self.clear_grapheme_at(x, y);
-        for continuation_x in (x + 1)..(x + width) {
-            self.clear_grapheme_at(continuation_x, y);
-        }
-
-        if let Some(index) = self.index(x, y) {
-            self.cells[index] = Cell {
-                symbol: grapheme.to_owned(),
-                continuation: false,
-                style,
-            };
-        }
-        for continuation_x in (x + 1)..(x + width) {
-            if let Some(index) = self.index(continuation_x, y) {
-                self.cells[index] = Cell::continuation(style);
-            }
-        }
-    }
-
-    /// Blanks the full grapheme covering `(x, y)`, walking left to the leading
-    /// cell if `(x, y)` is a continuation, then clearing its trailing cells.
-    fn clear_grapheme_at(&mut self, x: u16, y: u16) {
-        let Some(index) = self.index(x, y) else {
-            return;
-        };
-
-        if self.cells[index].is_continuation() {
-            let mut start_x = x;
-            while start_x > 0 {
-                let previous_x = start_x - 1;
-                let Some(previous_index) = self.index(previous_x, y) else {
-                    break;
-                };
-                start_x = previous_x;
-                if !self.cells[previous_index].is_continuation() {
-                    break;
-                }
-            }
-            self.clear_grapheme_at(start_x, y);
-            return;
-        }
-
-        self.cells[index] = Cell::blank();
-        let mut continuation_x = x.saturating_add(1);
-        while continuation_x < self.size.width {
-            let Some(continuation_index) = self.index(continuation_x, y) else {
-                break;
-            };
-            if !self.cells[continuation_index].is_continuation() {
-                break;
-            }
-            self.cells[continuation_index] = Cell::blank();
-            continuation_x += 1;
-        }
-    }
-
-    fn index(&self, x: u16, y: u16) -> Option<usize> {
-        if x >= self.size.width || y >= self.size.height {
-            return None;
-        }
-        Some(usize::from(y) * usize::from(self.size.width) + usize::from(x))
-    }
-}
-
-/// The column width of a grapheme cluster, floored at 1 so zero-width clusters
-/// (e.g. a lone combining mark) still occupy a cell.
-fn grapheme_width(grapheme: &str) -> u16 {
-    UnicodeWidthStr::width(grapheme)
-        .max(1)
-        .try_into()
-        .unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]

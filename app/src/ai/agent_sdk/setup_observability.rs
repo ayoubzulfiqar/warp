@@ -193,6 +193,7 @@ pub(crate) enum SetupStep {
     GlobalSkillResolution,
     GlobalSkillRepoClone,
     EnvironmentRepoClone,
+    CacheSetup,
     EnvironmentSetupCommands,
     EnvironmentCodebaseIndexing,
     FileBasedMcpDiscovery,
@@ -202,6 +203,12 @@ pub(crate) enum SetupStep {
     ConversationResumeLoading,
     ThirdPartyHarnessPreparation,
     ThirdPartyHarnessExternalConversation,
+    /// Sub-steps of [`SetupStep::ThirdPartyHarnessPreparation`] that track plugin
+    /// install/update latency and reliability individually.
+    ThirdPartyHarnessPreparationNotificationPluginInstall,
+    ThirdPartyHarnessPreparationNotificationPluginUpdate,
+    ThirdPartyHarnessPreparationPlatformPluginInstall,
+    ThirdPartyHarnessPreparationPlatformPluginUpdate,
 }
 
 macro_rules! span_and_name {
@@ -255,6 +262,9 @@ impl SetupStep {
             Self::EnvironmentRepoClone => {
                 span_and_name!("setup_environment_repo_clone")
             }
+            Self::CacheSetup => {
+                span_and_name!("setup_caches")
+            }
             Self::EnvironmentSetupCommands => {
                 span_and_name!("setup_environment_setup_commands")
             }
@@ -281,6 +291,18 @@ impl SetupStep {
             }
             Self::ThirdPartyHarnessExternalConversation => {
                 span_and_name!("setup_third_party_harness_external_conversation")
+            }
+            Self::ThirdPartyHarnessPreparationNotificationPluginInstall => {
+                span_and_name!("setup_third_party_harness_preparation_notification_plugin_install")
+            }
+            Self::ThirdPartyHarnessPreparationNotificationPluginUpdate => {
+                span_and_name!("setup_third_party_harness_preparation_notification_plugin_update")
+            }
+            Self::ThirdPartyHarnessPreparationPlatformPluginInstall => {
+                span_and_name!("setup_third_party_harness_preparation_platform_plugin_install")
+            }
+            Self::ThirdPartyHarnessPreparationPlatformPluginUpdate => {
+                span_and_name!("setup_third_party_harness_preparation_platform_plugin_update")
             }
         }
     }

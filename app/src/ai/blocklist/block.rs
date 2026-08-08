@@ -41,6 +41,7 @@ use repo_metadata::repositories::DetectedRepositories;
 use secret_redaction::*;
 use serde::Serialize;
 use settings::Setting as _;
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::Fill;
 use warp_core::ui::theme::color::internal_colors;
@@ -988,6 +989,11 @@ pub struct AIBlock {
     /// requested actions and requested commands are completed or cancelled.
     finish_reason: Option<FinishReason>,
 
+    /// `true` while agent-view Cmd-Up/Cmd-Down transcript navigation targets this block's user
+    /// query. Renders a navigation ring around the query row so the stop stays visibly
+    /// identifiable even when the viewport doesn't move.
+    is_agent_transcript_navigation_target: bool,
+
     directory_context: DirectoryContext,
     view_id: EntityId,
 
@@ -1101,6 +1107,23 @@ struct EmbeddedCodeEditorView {
     view: ViewHandle<CodeEditorView>,
     language: Option<ProgrammingLanguage>,
     length: usize,
+}
+/// Builds the authenticated Oz run-page URL for a recording artifact.
+///
+/// The task ID is assigned to the conversation by the server when the run
+/// starts, while the artifact UID comes directly from the StopRecording action.
+/// When either value is unavailable, callers should fall back to the signed
+/// artifact download URL.
+fn recording_artifact_view_url(
+    task_id: Option<AmbientAgentTaskId>,
+    artifact_uid: &str,
+) -> Option<String> {
+    let task_id = task_id?;
+    Some(format!(
+        "{}/runs/{task_id}?artifact={}",
+        ChannelState::oz_root_url(),
+        urlencoding::encode(artifact_uid),
+    ))
 }
 
 impl AIBlock {
@@ -1488,6 +1511,7 @@ impl AIBlock {
             num_attached_context_blocks,
             has_attached_context_selected_text,
             finish_reason: None,
+            is_agent_transcript_navigation_target: false,
             directory_context: DirectoryContext { pwd, home_dir },
             view_id: ctx.view_id(),
             detected_links_state,
@@ -2119,8 +2143,10 @@ impl AIBlock {
                     };
                     self.handle_mcp_tool_stream_update(
                         action_id,
+                        name,
                         &command_text,
                         display_input,
+                        *server_id,
                         ctx,
                     );
                 }
@@ -3604,15 +3630,19 @@ impl AIBlock {
     fn handle_mcp_tool_stream_update(
         &mut self,
         action_id: &AIAgentActionId,
+        tool_name: &str,
         command_text: &str,
         mcp_args: serde_json::Value,
+        server_id: Option<uuid::Uuid>,
         ctx: &mut ViewContext<Self>,
     ) {
         match self.requested_mcp_tools.get_mut(action_id) {
             Some(requested_mcp_tool) => {
                 requested_mcp_tool.view.update(ctx, |view, ctx| {
                     view.apply_streamed_update(command_text, ctx);
+                    view.update_mcp_tool_name(tool_name);
                     view.update_mcp_request(mcp_args);
+                    view.update_mcp_server_id(server_id);
                     ctx.notify();
                 });
             }
@@ -3633,7 +3663,9 @@ impl AIBlock {
                         ctx,
                     );
                     view.apply_streamed_update(command_text, ctx);
+                    view.update_mcp_tool_name(tool_name);
                     view.update_mcp_request(mcp_args);
+                    view.update_mcp_server_id(server_id);
                     view
                 });
                 let action_id_clone = action_id.clone();
@@ -4109,7 +4141,9 @@ impl AIBlock {
                 ctx.emit(AIBlockEvent::RunAwsLoginCommand);
             }
             AwsBedrockCredentialsErrorEvent::ConfigureLoginCommand => {
-                ctx.dispatch_typed_action(&WorkspaceAction::ShowSettingsPageWithSearch {
+                // Defer so Workspace is not opened while AIBlock is still mid-subscription.
+                // Synchronous dispatch here can panic with "Circular view update".
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::ShowSettingsPageWithSearch {
                     search_query: "aws bedrock".to_string(),
                     section: Some(SettingsSection::WarpAgent),
                 });
@@ -4149,7 +4183,9 @@ impl AIBlock {
                 }
             }
             GeminiEnterpriseCredentialsErrorEvent::OpenSettings => {
-                ctx.dispatch_typed_action(&WorkspaceAction::ShowSettingsPageWithSearch {
+                // Defer so Workspace is not opened while AIBlock is still mid-subscription.
+                // Synchronous dispatch here can panic with "Circular view update".
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::ShowSettingsPageWithSearch {
                     search_query: "gemini enterprise".to_string(),
                     section: Some(SettingsSection::WarpAgent),
                 });
@@ -4448,6 +4484,23 @@ impl AIBlock {
             .inputs_to_render(app)
             .iter()
             .any(|input| input.display_query().is_some())
+    }
+
+    /// `true` while agent-view transcript navigation targets this block's user query.
+    pub fn is_agent_transcript_navigation_target(&self) -> bool {
+        self.is_agent_transcript_navigation_target
+    }
+
+    /// Flags or unflags this block as the transcript navigation target.
+    pub fn set_agent_transcript_navigation_target(
+        &mut self,
+        is_target: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.is_agent_transcript_navigation_target != is_target {
+            self.is_agent_transcript_navigation_target = is_target;
+            ctx.notify();
+        }
     }
 
     /// `true` if the AI block is "finished".
@@ -6334,6 +6387,26 @@ pub enum AIBlockAction {
     },
 }
 
+#[cfg(feature = "local_fs")]
+fn open_code_action_event(
+    source: &CodeSource,
+    layout: crate::util::file::external_editor::settings::EditorLayout,
+) -> AIBlockEvent {
+    match source {
+        CodeSource::Link {
+            path, range_start, ..
+        } => AIBlockEvent::OpenDetectedFilePath {
+            absolute_path: path.clone(),
+            line_and_column_num: *range_start,
+            target_override: None,
+        },
+        _ => AIBlockEvent::OpenCodeInWarp {
+            source: source.clone(),
+            layout,
+        },
+    }
+}
+
 impl TypedActionView for AIBlock {
     type Action = AIBlockAction;
 
@@ -6834,12 +6907,10 @@ impl TypedActionView for AIBlock {
 
                 #[cfg(feature = "local_fs")]
                 {
-                    ctx.emit(AIBlockEvent::OpenCodeInWarp {
-                        source: source.clone(),
-                        layout: *crate::util::file::external_editor::EditorSettings::as_ref(ctx)
-                            .open_file_layout
-                            .value(),
-                    })
+                    let layout = *crate::util::file::external_editor::EditorSettings::as_ref(ctx)
+                        .open_file_layout
+                        .value();
+                    ctx.emit(open_code_action_event(source, layout));
                 }
             }
             AIBlockAction::ToggleTodoListExpanded(id) => {
@@ -6922,6 +6993,14 @@ impl TypedActionView for AIBlock {
                 ctx.open_url(url);
             }
             AIBlockAction::OpenRecordingArtifact { artifact_uid } => {
+                let conversation_id = self.client_ids.conversation_id;
+                let task_id = BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(&conversation_id)
+                    .and_then(|conversation| conversation.task_id());
+                if let Some(url) = recording_artifact_view_url(task_id, artifact_uid) {
+                    ctx.open_url(&url);
+                    return;
+                }
                 let ai_client = ServerApiProvider::handle(ctx).as_ref(ctx).get_ai_client();
                 let artifact_uid = artifact_uid.clone();
                 let artifact_uid_for_error = artifact_uid.clone();

@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -29,7 +30,9 @@ use command::Stdio;
 use command::r#async::Command;
 use futures_lite::future;
 use is_executable::IsExecutable as _;
+use itertools::Itertools;
 use sha2::{Digest, Sha256};
+use warp_core::safe_info;
 use warp_errors::{ErrorExt, register_error};
 
 pub mod spacectl;
@@ -349,6 +352,94 @@ fn has_command(command: &str) -> bool {
         std::env::split_paths(&path).any(|directory| directory.join(command).is_executable())
     })
 }
+/// Create a cache directory, escalating to `sudo` when ordinary creation is denied.
+///
+/// Cache roots may be located on a mounted volume whose parent directories are owned by root.
+/// After a permission-denied error, Unix hosts try one non-interactive `sudo mkdir -p` for the
+/// target and then transfer ownership of that target directory to the current effective user.
+/// Intermediate directories are not chowned, and any unavailable or unsuccessful fallback
+/// operation degrades to [`CacheSetupError::RootCreationFailed`].
+async fn create_cache_dir_all<F, Fut>(
+    path: &Path,
+    run_command: &mut F,
+) -> Result<(), CacheSetupError>
+where
+    F: FnMut(Command) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, CacheSetupError>>,
+{
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    match std::fs::create_dir_all(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() != ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                target: "build_cache",
+                error = ?error,
+                "failed to create cache directory"
+            );
+            return Err(CacheSetupError::RootCreationFailed);
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "build_cache",
+                error = ?error,
+                "cache directory creation was denied; trying sudo fallback"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = run_command;
+        Err(CacheSetupError::RootCreationFailed)
+    }
+
+    #[cfg(unix)]
+    {
+        if !has_command("sudo") {
+            tracing::warn!(
+                target: "build_cache",
+                "sudo is unavailable; cannot create cache directory"
+            );
+            return Err(CacheSetupError::RootCreationFailed);
+        }
+
+        let owner = current_owner();
+        let mut mkdir = Command::new_with_process_group("sudo");
+        mkdir.args(["-n", "mkdir", "-p"]).arg(path);
+        if let Err(error) = run_command(mkdir).await {
+            tracing::warn!(
+                target: "build_cache",
+                operation = "sudo mkdir",
+                error = ?error,
+                "sudo cache directory creation failed"
+            );
+            return Err(CacheSetupError::RootCreationFailed);
+        }
+
+        let mut chown = Command::new_with_process_group("sudo");
+        chown.args(["-n", "chown", &owner]).arg(path);
+        if let Err(error) = run_command(chown).await {
+            tracing::warn!(
+                target: "build_cache",
+                operation = "sudo chown",
+                error = ?error,
+                "sudo cache directory ownership update failed"
+            );
+            return Err(CacheSetupError::RootCreationFailed);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn current_owner() -> String {
+    let uid = nix::unistd::geteuid().as_raw();
+    let gid = nix::unistd::getegid().as_raw();
+    format!("{uid}:{gid}")
+}
 
 /// Default implementation of the `run_command` hook for [`setup_cache`].
 pub async fn default_run_command(command: Command) -> Result<Vec<u8>, CacheSetupError> {
@@ -424,7 +515,10 @@ where
         };
 
         // We create the scoped cache directory here, as `spacectl` fails if it doesn't exist.
-        if std::fs::create_dir_all(&configuration_root).is_err() {
+        if create_cache_dir_all(&configuration_root, &mut run_command)
+            .await
+            .is_err()
+        {
             report.invocations.push(failed_invocation(
                 scope,
                 Vec::new(),
@@ -461,6 +555,7 @@ where
         Ok(Some(plan)) => plan,
         Ok(None) => return report,
         Err(error) => {
+            tracing::error!(error = ?error, "Cache planning failed");
             report.invocations.push(failed_invocation(
                 CacheScope::Global,
                 Vec::new(),
@@ -478,7 +573,10 @@ where
     for configuration in &plan.configurations {
         let configuration_root = plan.cache_root.join(&configuration.relative_cache_dir);
         // All repo-scoped cache roots should already exist. However, we still need to create the global root.
-        let invocation = if std::fs::create_dir_all(&configuration_root).is_err() {
+        let invocation = if create_cache_dir_all(&configuration_root, &mut run_command)
+            .await
+            .is_err()
+        {
             failed_invocation(
                 configuration.scope.clone(),
                 configuration.modes.clone(),
@@ -487,6 +585,10 @@ where
                 Duration::ZERO,
             )
         } else {
+            safe_info!(
+                safe: ("Mounting cache modes {:?} for scope kind '{}'", configuration.modes, configuration.scope.kind()),
+                full: ("Mounting cache modes {:?} for {:?}", configuration.modes, configuration.scope)
+            );
             run_spacectl_mount(
                 configuration.scope.clone(),
                 configuration.modes.clone(),
@@ -500,6 +602,8 @@ where
         };
 
         if let Some(response) = &invocation.response {
+            tracing::info!(cache_result = ?response.output, modes = ?response.input.modes, scope = ?configuration.scope, "Mounted cache paths");
+
             match &configuration.scope {
                 CacheScope::Repository { .. } => {
                     for (name, value) in &response.output.add_envs {
@@ -565,13 +669,19 @@ where
 /// - `~/.cargo/registry` => `/cache/shared/$HOME/.cargo/registry`
 /// - `/workspace/repo-a/target` => `/cache/<repo-a-key>/target`
 /// - `/workspace/repo-b/target` => `/cache/<repo-b-key>/target`
+#[tracing::instrument(skip_all, fields(tags.cloud_agent = true, additional_global_modes = tracing::field::Empty, resolved_modes = tracing::field::Empty))]
 fn construct_plan(
     cache_root: PathBuf,
     mut detections: Vec<DetectedCacheModes>,
     additional_global_modes: Vec<String>,
 ) -> Result<Option<CacheSetupPlan>, CacheSetupError> {
+    tracing::Span::current().record(
+        "additional_global_modes",
+        additional_global_modes.iter().join(", "),
+    );
     for detection in &mut detections {
         detection.modes = canonical_modes(std::mem::take(&mut detection.modes));
+        tracing::info!(modes = ?detection.modes, repo_key = %detection.key, "Adding detected cache modes");
     }
     let mut global_modes = BTreeSet::new();
     for detection in &detections {
@@ -610,6 +720,7 @@ fn construct_plan(
             .expect("repository configuration")
             .cmp(right.scope.repo_key().expect("repository configuration"))
     });
+    tracing::Span::current().record("resolved_modes", global_modes.iter().join(", "));
     configurations.push(CacheConfiguration {
         scope: CacheScope::Global,
         cwd: scratch,

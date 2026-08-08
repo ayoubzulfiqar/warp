@@ -21,6 +21,17 @@ fn question(
     supports_other: bool,
     options: &[&str],
 ) -> AskUserQuestionItem {
+    question_with_recommended(id, text, is_multiselect, supports_other, options, &[])
+}
+
+fn question_with_recommended(
+    id: &str,
+    text: &str,
+    is_multiselect: bool,
+    supports_other: bool,
+    options: &[&str],
+    recommended_indices: &[usize],
+) -> AskUserQuestionItem {
     AskUserQuestionItem {
         question_id: id.to_owned(),
         question: text.to_owned(),
@@ -28,9 +39,10 @@ fn question(
             is_multiselect,
             options: options
                 .iter()
-                .map(|label| AskUserQuestionOption {
+                .enumerate()
+                .map(|(i, label)| AskUserQuestionOption {
                     label: (*label).to_owned(),
-                    recommended: false,
+                    recommended: recommended_indices.contains(&i),
                 })
                 .collect(),
             supports_other,
@@ -158,20 +170,186 @@ fn active_card_matches_question_panel_structure() {
         assert_eq!(
             lines,
             [
-                "┌──────────────────────────────────────────────────────────────────────────────┐",
-                "│                                                                              │",
-                "│ ■ Agent questions                                                 ← 1 of 2 → │",
-                "│                                                                              │",
-                "│ Which targets should be tested? (select all that apply)                      │",
-                "│ (1)   Stable                                                                 │",
-                "│ (2)   Nightly                                                                │",
-                "│ (3) Other…                                                                   │",
-                "│                                                                              │",
-                "│ Enter or number to select Tab or ← → to navigate Ctrl + C to cancel question │",
-                "│                                                                              │",
-                "└──────────────────────────────────────────────────────────────────────────────┘",
+                "▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁",
+                "▏                                                                              ▕",
+                "▏ ■ Agent questions                                                 ← 1 of 2 → ▕",
+                "▏                                                                              ▕",
+                "▏ Which targets should be tested? (select all that apply)                      ▕",
+                "▏ (1) [ ] Stable                                                               ▕",
+                "▏ (2) [ ] Nightly                                                              ▕",
+                "▏ (3) [ ] Other…                                                               ▕",
+                "▏                                                                              ▕",
+                "▏ Shift + Enter to advance Enter or number to select Ctrl + C to cancel questi ▕",
+                "▏                                                                              ▕",
+                "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
             ]
         );
+    });
+}
+
+#[test]
+fn focusing_an_active_question_delegates_to_the_selector() {
+    App::test((), |mut app| async move {
+        let (_, view) = add_view(
+            &mut app,
+            vec![question(
+                "single",
+                "Which shell?",
+                false,
+                false,
+                &["zsh", "fish"],
+            )],
+        );
+        queue_question_action(&mut app, &view);
+        let selector = app.read(|ctx| view.as_ref(ctx).selector.clone());
+
+        view.update(&mut app, |_, ctx| ctx.focus_self());
+
+        assert!(app.read(|ctx| selector.is_focused(ctx)));
+    });
+}
+#[test]
+fn enter_selects_options_and_other_before_shift_enter_advances_multiselect() {
+    App::test((), |mut app| async move {
+        app.update(crate::keybindings::init);
+        let (_, view) = add_view(
+            &mut app,
+            vec![
+                question(
+                    "multi",
+                    "Which targets?",
+                    true,
+                    true,
+                    &["Stable", "Nightly"],
+                ),
+                question("single", "Which shell?", false, false, &["zsh"]),
+            ],
+        );
+        queue_question_action(&mut app, &view);
+        present_active_view(&mut app, &view);
+
+        assert!(dispatch_focused_key(&mut app, &view, "enter"));
+        app.read(|ctx| {
+            let view = view.as_ref(ctx);
+            assert_eq!(view.session.current_question_index(), 0);
+            assert!(view.auto_advance.is_none());
+            assert!(
+                view.session
+                    .draft_for_question(0)
+                    .is_some_and(|draft| draft.selected_option_indices.contains(&0))
+            );
+        });
+        assert!(
+            render_active_lines(&mut app, &view)
+                .iter()
+                .any(|line| line.contains("(1) [✓] Stable"))
+        );
+
+        let selector = app.read(|ctx| view.as_ref(ctx).selector.clone());
+        selector.update(&mut app, |selector, ctx| {
+            selector.handle_action(&TuiOptionSelectorAction::SelectItem(2), ctx);
+            selector.set_active_custom_text_for_test("Canary", ctx);
+        });
+        assert!(dispatch_focused_key(&mut app, &view, "enter"));
+        app.read(|ctx| {
+            let view = view.as_ref(ctx);
+            assert_eq!(view.session.current_question_index(), 0);
+            assert!(view.auto_advance.is_none());
+            let draft = view
+                .session
+                .draft_for_question(0)
+                .expect("multi-select draft exists");
+            assert!(draft.selected_option_indices.contains(&0));
+            assert_eq!(draft.other_text.as_deref(), Some("Canary"));
+        });
+        assert!(
+            render_active_lines(&mut app, &view)
+                .iter()
+                .any(|line| line.contains("(3) [✓] Canary"))
+        );
+        assert!(dispatch_focused_key(&mut app, &view, "enter"));
+        app.read(|ctx| {
+            let view = view.as_ref(ctx);
+            let draft = view
+                .session
+                .draft_for_question(0)
+                .expect("regular multi-select option remains selected");
+            assert!(draft.selected_option_indices.contains(&0));
+            assert!(draft.other_text.is_none());
+        });
+        assert!(
+            render_active_lines(&mut app, &view)
+                .iter()
+                .any(|line| line.contains("(3) [ ] Other…"))
+        );
+
+        assert!(dispatch_focused_key(&mut app, &view, "shift-enter"));
+        assert_eq!(
+            app.read(|ctx| view.as_ref(ctx).session.current_question_index()),
+            1
+        );
+    });
+}
+
+#[test]
+fn enter_keeps_single_select_auto_advance_behavior() {
+    App::test((), |mut app| async move {
+        app.update(super::init);
+        let (_, view) = add_view(
+            &mut app,
+            vec![question(
+                "single",
+                "Which shell?",
+                false,
+                false,
+                &["zsh", "fish"],
+            )],
+        );
+        queue_question_action(&mut app, &view);
+        present_active_view(&mut app, &view);
+
+        assert!(dispatch_focused_key(&mut app, &view, "enter"));
+        app.read(|ctx| {
+            let view = view.as_ref(ctx);
+            assert!(view.auto_advance.is_some());
+            assert!(
+                view.session
+                    .draft_for_question(0)
+                    .is_some_and(|draft| draft.selected_option_indices.contains(&0))
+            );
+        });
+    });
+}
+
+#[test]
+fn enter_does_not_submit_a_final_multiselect_question() {
+    App::test((), |mut app| async move {
+        app.update(super::init);
+        let (_, view) = add_view(
+            &mut app,
+            vec![question(
+                "multi",
+                "Which targets?",
+                true,
+                true,
+                &["Stable", "Nightly"],
+            )],
+        );
+        queue_question_action(&mut app, &view);
+        present_active_view(&mut app, &view);
+
+        assert!(dispatch_focused_key(&mut app, &view, "enter"));
+        app.read(|ctx| {
+            let view = view.as_ref(ctx);
+            assert!(view.session.is_editing());
+            assert_eq!(view.session.current_question_index(), 0);
+            assert!(view.auto_advance.is_none());
+            assert!(
+                view.session
+                    .draft_for_question(0)
+                    .is_some_and(|draft| draft.selected_option_indices.contains(&0))
+            );
+        });
     });
 }
 
@@ -285,8 +463,8 @@ fn navigation_restores_multi_selection_and_other_text() {
         });
 
         let lines = render_active_lines(&mut app, &view);
-        assert!(lines.iter().any(|line| line.contains("✓ Nightly")));
-        assert!(lines.iter().any(|line| line.contains("Canary")));
+        assert!(lines.iter().any(|line| line.contains("[✓] Nightly")));
+        assert!(lines.iter().any(|line| line.contains("[✓] Canary")));
     });
 }
 
@@ -378,7 +556,7 @@ fn navigating_away_from_a_cleared_other_editor_removes_the_previous_answer() {
         let (_, view) = add_view(
             &mut app,
             vec![
-                question("q1", "Targets?", true, true, &["Stable"]),
+                question("q1", "Target?", false, true, &["Stable"]),
                 question("q2", "Shell?", false, false, &["zsh"]),
             ],
         );
@@ -408,6 +586,45 @@ fn navigating_away_from_a_cleared_other_editor_removes_the_previous_answer() {
             assert_eq!(view.session.current_question_index(), 1);
             assert!(view.session.draft_for_question(0).is_none());
         });
+    });
+}
+
+#[test]
+fn recommended_option_renders_recommended_badge() {
+    App::test((), |mut app| async move {
+        let (_, view) = add_view(
+            &mut app,
+            vec![question_with_recommended(
+                "q1",
+                "Which shell?",
+                false,
+                false,
+                &["zsh", "fish", "bash"],
+                &[1], // fish is recommended
+            )],
+        );
+
+        let lines = render_active_lines(&mut app, &view);
+        // The recommended option should have "  (recommended)" appended.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("fish") && line.contains("(recommended)")),
+            "expected a line with 'fish  (recommended)' but got: {lines:#?}"
+        );
+        // Non-recommended options must not show the badge.
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("zsh") || !line.contains("(recommended)")),
+            "expected zsh not to have (recommended) but got: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("bash") || !line.contains("(recommended)")),
+            "expected bash not to have (recommended) but got: {lines:#?}"
+        );
     });
 }
 

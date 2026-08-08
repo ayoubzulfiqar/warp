@@ -1,4 +1,5 @@
 mod convert;
+mod review_comments;
 
 use std::fmt::Display;
 use std::ops::Range;
@@ -6,6 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use itertools::Itertools as _;
+pub use review_comments::{
+    ReviewCommentThread, ReviewCommentThreadItem, format_review_comment_thread,
+    group_review_comment_threads,
+};
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumDiscriminants;
 use uuid::Uuid;
@@ -158,9 +163,12 @@ pub enum AIAgentActionType {
         window: Option<computer_use::Target>,
     },
 
-    /// AI requested to stop an in-progress recording and publish the video.
+    /// AI requested to stop an in-progress recording. When `should_persist` is
+    /// false the recording is discarded instead of uploaded; an unset proto
+    /// field defaults to `true` (persist).
     StopRecording {
         recording_id: String,
+        should_persist: bool,
     },
 
     // AI requested to read a skill.
@@ -608,8 +616,14 @@ impl Display for AIAgentActionType {
             AIAgentActionType::StartRecording { .. } => {
                 write!(f, "StartRecording")
             }
-            AIAgentActionType::StopRecording { recording_id } => {
-                write!(f, "StopRecording: {recording_id}")
+            AIAgentActionType::StopRecording {
+                recording_id,
+                should_persist,
+            } => {
+                write!(
+                    f,
+                    "StopRecording: {recording_id} (persist: {should_persist})"
+                )
             }
             AIAgentActionType::ReadSkill(req) => {
                 write!(f, "ReadSkill: {}", req.skill)

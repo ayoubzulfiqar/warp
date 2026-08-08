@@ -144,8 +144,7 @@ pub fn record_static_slash_command_accepted(
 }
 
 /// Records an input auto-detection setting toggle triggered from a TUI slash
-/// command (`/enable-natural-language-detection` or
-/// `/disable-natural-language-detection`).
+/// command (`/natural-language-detection`).
 ///
 /// Mirrors the `SettingsPage` and `Banner` origins used by the GUI toggle paths,
 /// but reports the toggle as originating from a TUI slash command.
@@ -794,6 +793,38 @@ impl Input {
                     toast_stack.add_ephemeral_toast(toast, window_id, ctx);
                 });
             }
+            SlashCommandKind::CopyDebuggingId => {
+                let conversation_id = self
+                    .ai_context_model
+                    .as_ref(ctx)
+                    .selected_conversation_id(ctx);
+                let debugging_payload = conversation_id
+                    .and_then(|conversation_id| {
+                        BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
+                    })
+                    .and_then(|conversation| conversation.debugging_server_conversation_token())
+                    .map(|token| token.debugging_payload(None));
+                match debugging_payload {
+                    Some(debugging_payload) => {
+                        ctx.clipboard()
+                            .write(ClipboardContent::plain_text(debugging_payload));
+                        let window_id = ctx.window_id();
+                        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                            toast_stack.add_ephemeral_toast(
+                                DismissibleToast::default(
+                                    "Debugging information copied to clipboard".to_owned(),
+                                ),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    }
+                    None => show_error_toast(
+                        "No debugging ID available for this conversation yet.".to_owned(),
+                        ctx,
+                    ),
+                }
+            }
             SlashCommandKind::ExportToFile => {
                 #[cfg(not(target_family = "wasm"))]
                 {
@@ -1256,11 +1287,21 @@ impl Input {
                 return false;
             }
             SlashCommandKind::AutoApprove
+            | SlashCommandKind::Statusline
+            | SlashCommandKind::ResetStatusline
+            | SlashCommandKind::ApiKeys
+            | SlashCommandKind::ConnectGrok
+            | SlashCommandKind::Upgrade
+            | SlashCommandKind::ManageBilling
             | SlashCommandKind::ViewLogs
-            | SlashCommandKind::EnableNaturalLanguageDetection
-            | SlashCommandKind::DisableNaturalLanguageDetection
+            | SlashCommandKind::Voice
+            | SlashCommandKind::NaturalLanguageDetection
+            | SlashCommandKind::Theme
+            | SlashCommandKind::VimMode
             | SlashCommandKind::Exit
-            | SlashCommandKind::Logout => {
+            | SlashCommandKind::Logout
+            | SlashCommandKind::Clear
+            | SlashCommandKind::Status => {
                 debug_assert!(
                     false,
                     "Attempted to execute TUI-only slash command in the GUI: {}",
